@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=scrcpy master
+Comment=GUI-лаунчер для scrcpy
+Exec=/home/YOUR_USERNAME/scrcpy_master/run.sh
+Icon=video-display
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true
