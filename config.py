@@ -75,6 +75,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "По умолчанию": copy.deepcopy(DEFAULT_PROFILE),
     },
     "last_used_profile": "По умолчанию",
+    # Список "ip:port" устройств, к которым когда-либо подключались по
+    # Wi-Fi — переживает `adb kill-server`/перезапуск adb-сервера, т.к.
+    # `adb devices` после этого показывает только то, что подключено
+    # заново. Позволяет одной кнопкой переподключить всё сразу.
+    "known_network_devices": [],
 }
 
 
@@ -116,8 +121,29 @@ def _merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         merged["last_used_profile"] = next(iter(merged["profiles"]))
 
+    known = data.get("known_network_devices") or []
+    # Отбрасываем дубликаты, сохраняя порядок, и игнорируем мусор не-строкового типа.
+    seen = set()
+    merged["known_network_devices"] = []
+    for item in known:
+        if isinstance(item, str) and item not in seen:
+            seen.add(item)
+            merged["known_network_devices"].append(item)
+
     return merged
 
 
 def new_profile() -> Dict[str, Any]:
     return copy.deepcopy(DEFAULT_PROFILE)
+
+
+def add_known_device(config: Dict[str, Any], ip_port: str) -> None:
+    known = config.setdefault("known_network_devices", [])
+    if ip_port not in known:
+        known.append(ip_port)
+
+
+def remove_known_device(config: Dict[str, Any], ip_port: str) -> None:
+    known = config.setdefault("known_network_devices", [])
+    if ip_port in known:
+        known.remove(ip_port)

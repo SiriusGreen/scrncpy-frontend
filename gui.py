@@ -5,6 +5,7 @@ gui.py — интерфейс на CustomTkinter: список устройст�
 from __future__ import annotations
 
 import copy
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Dict
@@ -76,6 +77,10 @@ class App(ctk.CTk):
         ctk.CTkButton(btns, text="Wi-Fi…", command=self._open_wifi_dialog).pack(
             side="left", expand=True, fill="x", padx=2
         )
+        ctk.CTkButton(
+            left, text="🔄 Переподключить сохранённые Wi-Fi",
+            command=self._reconnect_known_devices,
+        ).pack(fill="x", padx=8, pady=(0, 4))
         ctk.CTkButton(left, text="Перезапустить adb-сервер", command=self._restart_adb).pack(
             fill="x", padx=8, pady=(0, 10)
         )
@@ -113,17 +118,17 @@ class App(ctk.CTk):
             width=220,
         )
         self.profile_combo.pack(side="left")
-        ctk.CTkButton(profile_bar, text="Новый", width=70, command=self._new_profile).pack(
+        ctk.CTkButton(profile_bar, text="New", width=70, command=self._new_profile).pack(
             side="left", padx=3
         )
-        ctk.CTkButton(profile_bar, text="Клонировать", width=95, command=self._clone_profile).pack(
+        ctk.CTkButton(profile_bar, text="Clone", width=95, command=self._clone_profile).pack(
             side="left", padx=3
         )
-        ctk.CTkButton(profile_bar, text="Удалить", width=70, command=self._delete_profile).pack(
+        ctk.CTkButton(profile_bar, text="Del", width=70, command=self._delete_profile).pack(
             side="left", padx=3
         )
         ctk.CTkButton(
-            profile_bar, text="Сохранить профиль", command=self._save_current_profile
+            profile_bar, text="Save", command=self._save_current_profile
         ).pack(side="right", padx=3)
 
         self.tabview = ctk.CTkTabview(right)
@@ -414,7 +419,6 @@ class App(ctk.CTk):
 
     def _start_specific(self, serial: str):
         self.selected_target.set(serial)
-#        self._update_status_label()
         self._start_selected(force_target=serial)
 
     def _stop_specific(self, serial: str):
@@ -435,6 +439,26 @@ class App(ctk.CTk):
     # --------------------------------------------------------- Wi-Fi
     def _open_wifi_dialog(self):
         WifiDialog(self)
+
+    def _reconnect_known_devices(self):
+        known = list(self.config_data.get("known_network_devices", []))
+        if not known:
+            self._log("Список сохранённых Wi-Fi устройств пуст — сначала подключитесь хотя бы раз через «Wi-Fi…».")
+            return
+
+        self._log(f">>> Переподключаю {len(known)} сохранённых Wi-Fi устройств…")
+        adb_path = self.adb_path_var.get()
+
+        def worker():
+            for ip_port in known:
+                try:
+                    output = adb_utils.connect_tcpip(adb_path, ip_port)
+                    self.after(0, self._log, output.strip())
+                except adb_utils.AdbError as exc:
+                    self.after(0, self._log, f"ОШИБКА ({ip_port}): {exc}")
+            self.after(0, self.refresh_devices)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _restart_adb(self):
         try:
@@ -484,46 +508,98 @@ def _ask_text(parent, title: str, prompt: str, default: str = "") -> "str | None
 
 
 class WifiDialog(ctk.CTkToplevel):
-    """Подключение по TCP/IP и беспроводное сопряжение (Android 11+)."""
+    """Подключение по TCP/IP, сканирование локальной сети, беспроводное
+    сопряжение (Android 11+) и список уже известных Wi-Fi устройств."""
 
     def __init__(self, app: App):
         super().__init__(app)
         self.app = app
         self.title("Wi-Fi подключение")
-        self.geometry("440x340")
+        self.geometry("480x640")
         self.grab_set()
 
+        scroll = ctk.CTkScrollableFrame(self)
+        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # --- включить TCP/IP на уже подключённом по USB устройстве ---
         ctk.CTkLabel(
-            self, text="Уже подключён по USB → включить TCP/IP", font=("", 12, "bold")
-        ).pack(anchor="w", padx=12, pady=(12, 2))
+            scroll, text="Уже подключён по USB → включить TCP/IP", font=("", 12, "bold")
+        ).pack(anchor="w", padx=8, pady=(8, 2))
         ctk.CTkButton(
-            self, text="Включить TCP/IP на 5555 для выбранного устройства",
+            scroll, text="Включить TCP/IP на 5555 для выбранного устройства",
             command=self._enable_tcpip,
-        ).pack(fill="x", padx=12, pady=4)
+        ).pack(fill="x", padx=8, pady=4)
 
-        ctk.CTkLabel(self, text="Подключиться по IP:PORT", font=("", 12, "bold")).pack(
-            anchor="w", padx=12, pady=(16, 2)
+        # --- подключение по известному адресу вручную ---
+        ctk.CTkLabel(scroll, text="Подключиться по IP:PORT", font=("", 12, "bold")).pack(
+            anchor="w", padx=8, pady=(16, 2)
         )
-        self.connect_entry = ctk.CTkEntry(self, placeholder_text="192.168.1.50:5555")
-        self.connect_entry.pack(fill="x", padx=12, pady=2)
-        ctk.CTkButton(self, text="Подключиться", command=self._connect).pack(
-            fill="x", padx=12, pady=4
+        self.connect_entry = ctk.CTkEntry(scroll, placeholder_text="192.168.1.50:5555")
+        self.connect_entry.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(scroll, text="Подключиться", command=self._connect).pack(
+            fill="x", padx=8, pady=4
         )
 
+        # --- сканирование локальной сети ---
+        ctk.CTkLabel(scroll, text="Найти устройства в сети", font=("", 12, "bold")).pack(
+            anchor="w", padx=8, pady=(16, 2)
+        )
         ctk.CTkLabel(
-            self, text="Беспроводное сопряжение (Android 11+, без USB)", font=("", 12, "bold"),
-        ).pack(anchor="w", padx=12, pady=(16, 2))
+            scroll,
+            text="Проверяет порт 5555 (adb tcpip) на всех хостах локальной подсети. "
+                 "Двойной клик по найденному адресу — подключиться и запомнить.",
+            text_color="gray", wraplength=440, justify="left",
+        ).pack(anchor="w", padx=8)
+
+        scan_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        scan_row.pack(fill="x", padx=8, pady=4)
+        self.scan_button = ctk.CTkButton(scan_row, text="Сканировать", command=self._start_scan)
+        self.scan_button.pack(side="left")
+        self.scan_status_label = ctk.CTkLabel(scan_row, text="")
+        self.scan_status_label.pack(side="left", padx=10)
+
+        self.scan_results_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self.scan_results_frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        # --- сохранённые Wi-Fi устройства (переживают перезапуск adb-сервера) ---
+        known_header = ctk.CTkFrame(scroll, fg_color="transparent")
+        known_header.pack(fill="x", padx=8, pady=(16, 2))
+        ctk.CTkLabel(known_header, text="Сохранённые Wi-Fi устройства", font=("", 12, "bold")).pack(
+            side="left"
+        )
+        ctk.CTkButton(
+            known_header, text="Подключить все", width=110,
+            command=lambda: self.app._reconnect_known_devices(),
+        ).pack(side="right")
         ctk.CTkLabel(
-            self,
+            scroll,
+            text="Двойной клик по адресу — подключиться заново (например, после "
+                 "«Перезапустить adb-сервер», когда список устройств пуст).",
+            text_color="gray", wraplength=440, justify="left",
+        ).pack(anchor="w", padx=8)
+
+        self.known_devices_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self.known_devices_frame.pack(fill="x", padx=8, pady=(2, 4))
+        self._render_known_devices()
+
+        # --- беспроводное сопряжение Android 11+ ---
+        ctk.CTkLabel(
+            scroll, text="Беспроводное сопряжение (Android 11+, без USB)", font=("", 12, "bold"),
+        ).pack(anchor="w", padx=8, pady=(16, 2))
+        ctk.CTkLabel(
+            scroll,
             text="Настройки → Для разработчиков → Отладка по Wi-Fi → Сопряжение по коду",
-            text_color="gray", wraplength=400,
-        ).pack(anchor="w", padx=12)
-        self.pair_addr_entry = ctk.CTkEntry(self, placeholder_text="192.168.1.50:41235 (адрес пары)")
-        self.pair_addr_entry.pack(fill="x", padx=12, pady=(6, 2))
-        self.pair_code_entry = ctk.CTkEntry(self, placeholder_text="123456 (код)")
-        self.pair_code_entry.pack(fill="x", padx=12, pady=2)
-        ctk.CTkButton(self, text="Сопрячь", command=self._pair).pack(fill="x", padx=12, pady=4)
+            text_color="gray", wraplength=440,
+        ).pack(anchor="w", padx=8)
+        self.pair_addr_entry = ctk.CTkEntry(scroll, placeholder_text="192.168.1.50:41235 (адрес пары)")
+        self.pair_addr_entry.pack(fill="x", padx=8, pady=(6, 2))
+        self.pair_code_entry = ctk.CTkEntry(scroll, placeholder_text="123456 (код)")
+        self.pair_code_entry.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(scroll, text="Сопрячь", command=self._pair).pack(
+            fill="x", padx=8, pady=(4, 12)
+        )
 
+    # ------------------------------------------------------------ USB → TCP/IP
     def _enable_tcpip(self):
         target = self.app.selected_target.get()
         if not target:
@@ -555,17 +631,101 @@ class WifiDialog(ctk.CTkToplevel):
         else:
             self.app._log("Не удалось автоматически определить IP устройства — введите его вручную ниже.")
 
+    # ------------------------------------------------------------ подключение
     def _connect(self):
         ip_port = self.connect_entry.get().strip()
-        if not ip_port:
-            return
+        if ip_port:
+            self._connect_and_remember(ip_port)
+
+    def _connect_and_remember(self, ip_port: str):
+        """Подключается по ip:port и запоминает адрес в списке известных
+        Wi-Fi устройств, чтобы он не терялся после adb kill-server."""
         try:
             output = adb_utils.connect_tcpip(self.app.adb_path_var.get(), ip_port)
             self.app._log(output.strip())
         except adb_utils.AdbError as exc:
             self.app._log(f"ОШИБКА: {exc}")
+        cfg.add_known_device(self.app.config_data, ip_port)
+        cfg.save_config(self.app.config_data)
+        self._render_known_devices()
         self.app.refresh_devices()
 
+    # ------------------------------------------------------------ сканирование
+    def _start_scan(self):
+        self.scan_button.configure(state="disabled")
+        self.scan_status_label.configure(text="Сканирую сеть…")
+        for widget in self.scan_results_frame.winfo_children():
+            widget.destroy()
+
+        adb_path = self.app.adb_path_var.get()
+
+        def worker():
+            try:
+                found = adb_utils.scan_network_for_adb(port=5555, timeout=0.3)
+            except Exception as exc:
+                found = []
+                self.after(0, self.app._log, f"Ошибка сканирования сети: {exc}")
+            self.after(0, self._on_scan_done, found)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_scan_done(self, found: "list[str]"):
+        self.scan_button.configure(state="normal")
+        if not found:
+            self.scan_status_label.configure(
+                text="Ничего не найдено (порт 5555 нигде не открыт в локальной сети)"
+            )
+            return
+        self.scan_status_label.configure(text=f"Найдено адресов: {len(found)}")
+        for ip in found:
+            ip_port = f"{ip}:5555"
+            row = ctk.CTkFrame(self.scan_results_frame, fg_color=("gray86", "gray17"))
+            row.pack(fill="x", pady=2)
+            label = ctk.CTkLabel(row, text=ip_port, anchor="w")
+            label.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+            label.bind(
+                "<Double-Button-1>", lambda _e, addr=ip_port: self._connect_and_remember(addr)
+            )
+            ctk.CTkButton(
+                row, text="Подключить", width=90,
+                command=lambda addr=ip_port: self._connect_and_remember(addr),
+            ).pack(side="right", padx=6, pady=4)
+
+    # ------------------------------------------------------ сохранённые адреса
+    def _render_known_devices(self):
+        for widget in self.known_devices_frame.winfo_children():
+            widget.destroy()
+
+        known = self.app.config_data.get("known_network_devices", [])
+        if not known:
+            ctk.CTkLabel(self.known_devices_frame, text="Пока пусто", text_color="gray").pack(
+                anchor="w", padx=4, pady=2
+            )
+            return
+
+        for ip_port in known:
+            row = ctk.CTkFrame(self.known_devices_frame, fg_color=("gray86", "gray17"))
+            row.pack(fill="x", pady=2)
+            label = ctk.CTkLabel(row, text=ip_port, anchor="w")
+            label.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+            label.bind(
+                "<Double-Button-1>", lambda _e, addr=ip_port: self._connect_and_remember(addr)
+            )
+            ctk.CTkButton(
+                row, text="Подключить", width=90,
+                command=lambda addr=ip_port: self._connect_and_remember(addr),
+            ).pack(side="right", padx=(0, 4), pady=4)
+            ctk.CTkButton(
+                row, text="✕", width=28, fg_color="#b71c1c", hover_color="#7f0000",
+                command=lambda addr=ip_port: self._forget_known(addr),
+            ).pack(side="right", padx=(0, 4), pady=4)
+
+    def _forget_known(self, ip_port: str):
+        cfg.remove_known_device(self.app.config_data, ip_port)
+        cfg.save_config(self.app.config_data)
+        self._render_known_devices()
+
+    # ------------------------------------------------------------ сопряжение
     def _pair(self):
         addr = self.pair_addr_entry.get().strip()
         code = self.pair_code_entry.get().strip()

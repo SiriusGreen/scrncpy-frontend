@@ -1,12 +1,17 @@
 """
 adb_utils.py — обёртки над adb: список устройств, подключение по Wi-Fi,
-беспроводное сопряжение (Android 11+). Никаких shell=True и Linux-специфичных
-утилит (pkill/ip neigh) — только сам adb, поэтому эти функции переносимы,
-даже если сегодня используются только на Linux.
+беспроводное сопряжение (Android 11+), сканирование локальной сети на
+предмет открытого adb-порта. Никаких shell=True и Linux-специфичных
+утилит (pkill/ip neigh) для управления устройствами — только сам adb,
+поэтому эти функции переносимы. Сканирование сети использует `ip` (есть
+в net-tools/iproute2 на всех современных дистрибутивах Linux).
 """
 from __future__ import annotations
 
+import concurrent.futures
+import ipaddress
 import re
+import socket
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
@@ -130,3 +135,83 @@ def scrcpy_version(scrcpy_path: str = "scrcpy") -> Optional[str]:
     output = (result.stdout or "") + (result.stderr or "")
     match = re.search(r"scrcpy (\d+\.\d+(?:\.\d+)?)", output)
     return match.group(1) if match else None
+
+
+def get_local_ipv4_networks() -> List[str]:
+    """Определяет локальные IPv4-подсети (в виде CIDR-строк) по выводу
+    `ip -4 -o addr show` — так можно узнать, какие сети сканировать, не
+    зная заранее IP телефона."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    networks: List[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        for i, token in enumerate(parts):
+            if token == "inet" and i + 1 < len(parts):
+                try:
+                    iface = ipaddress.ip_interface(parts[i + 1])
+                except ValueError:
+                    continue
+                if iface.ip.is_loopback:
+                    continue
+                networks.append(str(iface.network))
+
+    seen = set()
+    unique: List[str] = []
+    for net in networks:
+        if net not in seen:
+            seen.add(net)
+            unique.append(net)
+    return unique
+
+
+def _port_is_open(ip: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def scan_network_for_adb(
+    port: int = 5555, timeout: float = 0.3, max_workers: int = 64, max_hosts_per_net: int = 1024,
+) -> List[str]:
+    """Сканирует локальные подсети на предмет открытого TCP-порта adb
+    (по умолчанию 5555 — стандартный порт `adb tcpip`). Открытый порт не
+    гарантирует, что это именно adbd (может быть любой другой сервис) —
+    финальную проверку всё равно делает `adb connect`, это лишь способ
+    не искать IP телефона вручную."""
+    hosts: List[str] = []
+    for cidr in get_local_ipv4_networks():
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if network.num_addresses > max_hosts_per_net:
+            # Слишком большая сеть (например, ошибочно распознанный /8) — пропускаем,
+            # чтобы не зависнуть на часы.
+            continue
+        hosts.extend(str(host) for host in network.hosts())
+
+    if not hosts:
+        return []
+
+    found: List[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_port_is_open, host, port, timeout): host for host in hosts
+        }
+        for future in concurrent.futures.as_completed(futures):
+            host = futures[future]
+            try:
+                if future.result():
+                    found.append(host)
+            except Exception:
+                continue
+
+    return sorted(found, key=lambda ip: tuple(int(p) for p in ip.split(".")))
