@@ -1,0 +1,1 @@
+# scrncpy-frontend
