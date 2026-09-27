@@ -414,7 +414,7 @@ class App(ctk.CTk):
 
     def _start_specific(self, serial: str):
         self.selected_target.set(serial)
-        self._update_status_label()
+#        self._update_status_label()
         self._start_selected(force_target=serial)
 
     def _stop_specific(self, serial: str):
