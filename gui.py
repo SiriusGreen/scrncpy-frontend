@@ -81,7 +81,7 @@ class App(ctk.CTk):
         self._build_right_panel()
 
     def _build_left_panel(self):
-        left = ctk.CTkFrame(self, width=330)
+        left = ctk.CTkFrame(self, width=380)
         left.grid(row=0, column=0, sticky="nsw", padx=(10, 5), pady=10)
         left.grid_propagate(False)
 
@@ -93,7 +93,7 @@ class App(ctk.CTk):
             text_color="gray", font=("", 10),
         ).pack(anchor="w", padx=10, pady=(0, 4))
 
-        self.device_list_frame = ctk.CTkScrollableFrame(left, width=305, height=380)
+        self.device_list_frame = ctk.CTkScrollableFrame(left, width=355, height=380)
         self.device_list_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         btns = ctk.CTkFrame(left, fg_color="transparent")
@@ -333,22 +333,22 @@ class App(ctk.CTk):
 
         for device in self.devices:
             running = self.runner.is_running(device.serial)
-            status_text = f"{device.display_name} — {device.state}"
+            status_text = f"{device.display_name}\n{device.state}"
             if running:
                 status_text += " • запущен"
 
             row = ctk.CTkFrame(self.device_list_frame, fg_color=("gray86", "gray17"))
             row.pack(fill="x", pady=3, padx=2)
 
+            # ВАЖНО: pack раздаёт место в порядке создания виджетов. Если
+            # растягиваемая надпись упакована раньше кнопок, длинный текст
+            # («… • запущен») забирает всю ширину и кнопки выдавливает за
+            # край строки. Поэтому сначала упаковываем радиокнопку и кнопки
+            # справа, а надпись — последней: ей достаётся остаток места.
             radio = ctk.CTkRadioButton(
                 row, text="", variable=self.selected_target, value=device.serial, width=18,
             )
             radio.pack(side="left", padx=(6, 0), pady=6)
-
-            color = "#43a047" if running else ("#fdd835" if device.state != "device" else None)
-            label = ctk.CTkLabel(row, text=status_text, text_color=color, anchor="w")
-            label.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=6)
-            label.bind("<Double-Button-1>", lambda _e, s=device.serial: self._start_specific(s))
 
             ctk.CTkButton(
                 row, text="■", width=28, fg_color="#b71c1c", hover_color="#7f0000",
@@ -364,6 +364,14 @@ class App(ctk.CTk):
                 row, text="⧉", width=28,
                 command=lambda s=device.serial: self._copy_to_clipboard(s),
             ).pack(side="right", padx=(3, 0), pady=6)
+
+            color = "#43a047" if running else ("#fdd835" if device.state != "device" else None)
+            label = ctk.CTkLabel(
+                row, text=status_text, text_color=color, anchor="w", justify="left",
+                wraplength=190,
+            )
+            label.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=6)
+            label.bind("<Double-Button-1>", lambda _e, s=device.serial: self._start_specific(s))
 
     # --------------------------------------------------------- профили
     def _collect_profile_from_form(self) -> dict:
@@ -478,6 +486,11 @@ class App(ctk.CTk):
 
     def _start_specific(self, serial: str):
         self.selected_target.set(serial)
+        if self.runner.is_running(serial):
+            # Двойной клик по уже запущенному устройству — не ошибка, а просто
+            # напоминание; модальное окно тут только мешает.
+            self._log(f"scrcpy для {serial} уже запущен (для остановки нажмите ■)")
+            return
         self._start_selected(force_target=serial)
 
     def _stop_specific(self, serial: str):
