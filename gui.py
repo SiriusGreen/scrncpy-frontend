@@ -361,7 +361,8 @@ class App(ctk.CTk):
                 command=lambda s=device.serial: self._start_specific(s),
             ).pack(side="right", padx=(3, 0), pady=6)
             ctk.CTkButton(
-                row, text="⧉", width=28,
+#                row, text="⧉", width=28,
+                row, text="COPY IP", width=36,
                 command=lambda s=device.serial: self._copy_to_clipboard(s),
             ).pack(side="right", padx=(3, 0), pady=6)
 
