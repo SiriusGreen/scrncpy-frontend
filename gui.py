@@ -5,6 +5,7 @@ gui.py — интерфейс на CustomTkinter: список устройст�
 from __future__ import annotations
 
 import copy
+import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -41,10 +42,36 @@ class App(ctk.CTk):
         # тем же ключам, что и в config.DEFAULT_PROFILE
         self.fields: Dict[str, tk.Variable] = {}
 
+        # Очередь для вызовов UI из фоновых потоков: tkinter не потокобезопасен,
+        # поэтому потоки НЕ трогают виджеты и self.after(), а кладут вызовы сюда,
+        # а главный поток разбирает очередь сам (см. _drain_ui_queue).
+        self._ui_queue: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._refresh_busy = False
+        self._refresh_pending = False
+        self._last_adb_error: "str | None" = None
+
         self._build_layout()
         self._load_profile_into_form(self.current_profile_name.get())
+        self.after(50, self._drain_ui_queue)
         self.refresh_devices()
         self._schedule_poll()
+
+    # ------------------------------------------------- вызовы из потоков
+    def call_in_ui(self, fn, *args):
+        """Потокобезопасно: выполнить fn(*args) в главном потоке tkinter."""
+        self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as exc:  # один сбойный колбэк не должен ронять цикл
+                    print(f"UI callback error: {exc!r}")
+        except queue.Empty:
+            pass
+        self.after(50, self._drain_ui_queue)
 
     # ---------------------------------------------------------------- layout
     def _build_layout(self):
@@ -242,20 +269,52 @@ class App(ctk.CTk):
         self._add_str_field(tab, 1, "", "extra_args", width=320)
 
     # --------------------------------------------------------- устройства
-    def refresh_devices(self):
+    def refresh_devices(self, force_render: bool = True):
+        """Обновляет список устройств в фоновом потоке, чтобы зависший adb
+        не замораживал окно. Параллельные запросы схлопываются в один."""
+        if self._refresh_busy:
+            self._refresh_pending = True
+            return
+        self._refresh_busy = True
+        adb_path = self.adb_path_var.get()  # Tk-переменные читаем только в главном потоке
+        threading.Thread(
+            target=self._refresh_worker, args=(adb_path, force_render), daemon=True
+        ).start()
+
+    def _refresh_worker(self, adb_path: str, force_render: bool):
         try:
-            self.devices = adb_utils.list_devices(self.adb_path_var.get())
+            devices, error = adb_utils.list_devices(adb_path), None
         except adb_utils.AdbError as exc:
-            self._log(f"ОШИБКА adb: {exc}")
-            self.devices = []
-        self._render_device_list()
+            devices, error = [], str(exc)
+        except Exception as exc:
+            devices, error = [], repr(exc)
+        self.call_in_ui(self._apply_refresh, devices, error, force_render)
+
+    def _apply_refresh(self, devices, error, force_render: bool):
+        self._refresh_busy = False
+        if error and error != self._last_adb_error:
+            self._log(f"ОШИБКА adb: {error}")  # одну и ту же ошибку не повторяем каждые 3 с
+        self._last_adb_error = error
+
+        def signature(items):
+            return [(d.serial, d.state, d.model) for d in items]
+
+        changed = signature(devices) != signature(self.devices)
+        self.devices = devices
+        if changed or force_render:
+            self._render_device_list()
+
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.refresh_devices()
 
     def _schedule_poll(self):
         interval = self.config_data["settings"].get("poll_interval_ms", 3000)
         self.after(interval, self._poll_devices)
 
     def _poll_devices(self):
-        self.refresh_devices()
+        # Периодический опрос перерисовывает список только при изменениях.
+        self.refresh_devices(force_render=False)
         self._schedule_poll()
 
     def _render_device_list(self):
@@ -409,8 +468,8 @@ class App(ctk.CTk):
                 profile=profile,
                 profile_name=profile_name,
                 records_dir=records_dir,
-                on_output=lambda line: self.after(0, self._log, line),
-                on_exit=lambda key, code: self.after(0, self._on_session_exit, key, code),
+                on_output=lambda line: self.call_in_ui(self._log, line),
+                on_exit=lambda key, code: self.call_in_ui(self._on_session_exit, key, code),
             )
             self._log(f">>> Запуск scrcpy для {target} (профиль «{profile_name}»)")
         except RuntimeError as exc:
@@ -422,9 +481,13 @@ class App(ctk.CTk):
         self._start_selected(force_target=serial)
 
     def _stop_specific(self, serial: str):
-        self.runner.stop(serial)
-        self._log(f">>> scrcpy для {serial} остановлен")
-        self._render_device_list()
+        # terminate()+wait() могут ждать до 5 с — делаем это вне главного потока.
+        def worker():
+            self.runner.stop(serial)
+            self.call_in_ui(self._log, f">>> scrcpy для {serial} остановлен")
+            self.call_in_ui(self._render_device_list)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _copy_to_clipboard(self, text: str):
         self.clipboard_clear()
@@ -453,20 +516,25 @@ class App(ctk.CTk):
             for ip_port in known:
                 try:
                     output = adb_utils.connect_tcpip(adb_path, ip_port)
-                    self.after(0, self._log, output.strip())
+                    self.call_in_ui(self._log, output.strip())
                 except adb_utils.AdbError as exc:
-                    self.after(0, self._log, f"ОШИБКА ({ip_port}): {exc}")
-            self.after(0, self.refresh_devices)
+                    self.call_in_ui(self._log, f"ОШИБКА ({ip_port}): {exc}")
+            self.call_in_ui(self.refresh_devices)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _restart_adb(self):
-        try:
-            adb_utils.restart_server(self.adb_path_var.get())
-            self._log("adb-сервер перезапущен")
-        except adb_utils.AdbError as exc:
-            self._log(f"ОШИБКА: {exc}")
-        self.refresh_devices()
+        adb_path = self.adb_path_var.get()
+
+        def worker():
+            try:
+                adb_utils.restart_server(adb_path)
+                self.call_in_ui(self._log, "adb-сервер перезапущен")
+            except adb_utils.AdbError as exc:
+                self.call_in_ui(self._log, f"ОШИБКА: {exc}")
+            self.call_in_ui(self.refresh_devices)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _save_paths(self):
         self.config_data["settings"]["adb_path"] = self.adb_path_var.get().strip() or "adb"
@@ -640,15 +708,21 @@ class WifiDialog(ctk.CTkToplevel):
     def _connect_and_remember(self, ip_port: str):
         """Подключается по ip:port и запоминает адрес в списке известных
         Wi-Fi устройств, чтобы он не терялся после adb kill-server."""
-        try:
-            output = adb_utils.connect_tcpip(self.app.adb_path_var.get(), ip_port)
-            self.app._log(output.strip())
-        except adb_utils.AdbError as exc:
-            self.app._log(f"ОШИБКА: {exc}")
+        # Адрес запоминаем сразу; сам connect (до 10 с) идёт в фоне.
         cfg.add_known_device(self.app.config_data, ip_port)
         cfg.save_config(self.app.config_data)
         self._render_known_devices()
-        self.app.refresh_devices()
+        adb_path = self.app.adb_path_var.get()
+
+        def worker():
+            try:
+                output = adb_utils.connect_tcpip(adb_path, ip_port)
+                self.app.call_in_ui(self.app._log, output.strip())
+            except adb_utils.AdbError as exc:
+                self.app.call_in_ui(self.app._log, f"ОШИБКА: {exc}")
+            self.app.call_in_ui(self.app.refresh_devices)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------------ сканирование
     def _start_scan(self):
@@ -664,8 +738,8 @@ class WifiDialog(ctk.CTkToplevel):
                 found = adb_utils.scan_network_for_adb(port=5555, timeout=0.3)
             except Exception as exc:
                 found = []
-                self.after(0, self.app._log, f"Ошибка сканирования сети: {exc}")
-            self.after(0, self._on_scan_done, found)
+                self.app.call_in_ui(self.app._log, f"Ошибка сканирования сети: {exc}")
+            self.app.call_in_ui(self._on_scan_done, found)
 
         threading.Thread(target=worker, daemon=True).start()
 

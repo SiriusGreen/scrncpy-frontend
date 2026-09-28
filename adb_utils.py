@@ -35,18 +35,31 @@ class AdbError(RuntimeError):
 
 def _run(adb_path: str, args: List[str], timeout: float = 10.0) -> str:
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [adb_path, *args],
-            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
         )
     except FileNotFoundError as exc:
         raise AdbError(f"Не найден исполняемый файл adb: {adb_path!r}") from exc
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        # subprocess.run после kill() ждёт закрытия пайпов без ограничения, а
+        # демон adb (форк при старте сервера) может держать их открытыми —
+        # поэтому дожидаемся коротко и в любом случае выходим.
+        try:
+            proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
         raise AdbError(f"adb {' '.join(args)} не ответил за {timeout} с") from exc
 
-    output = (result.stdout or "") + (result.stderr or "")
-    if result.returncode != 0 and not output.strip():
-        raise AdbError(f"adb {' '.join(args)} завершился с кодом {result.returncode}")
+    output = (stdout or "") + (stderr or "")
+    if proc.returncode != 0 and not output.strip():
+        raise AdbError(f"adb {' '.join(args)} завершился с кодом {proc.returncode}")
     return output
 
 
