@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Dict
@@ -26,7 +27,8 @@ ORIENTATIONS = ["unlocked", "initial", "0", "1", "2", "3"]
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("scrcpy master")
+        # при правках изменять номер версии
+        self.title("Scroid v1.10 feat. Claude")
         self.geometry("1080x720")
         self.minsize(920, 620)
 
@@ -34,6 +36,8 @@ class App(ctk.CTk):
         self.runner = ScrcpyRunner(self.config_data["settings"]["scrcpy_path"])
 
         self.devices: list[adb_utils.Device] = []
+        # serial -> {"manufacturer":..., "model":..., "android":...} | "pending"
+        self._device_info_cache: dict = {}
         self.selected_target = tk.StringVar(value="")
         self.current_profile_name = tk.StringVar(
             value=self.config_data.get("last_used_profile", "По умолчанию")
@@ -81,7 +85,7 @@ class App(ctk.CTk):
         self._build_right_panel()
 
     def _build_left_panel(self):
-        left = ctk.CTkFrame(self, width=380)
+        left = ctk.CTkFrame(self, width=430)
         left.grid(row=0, column=0, sticky="nsw", padx=(10, 5), pady=10)
         left.grid_propagate(False)
 
@@ -93,7 +97,21 @@ class App(ctk.CTk):
             text_color="gray", font=("", 10),
         ).pack(anchor="w", padx=10, pady=(0, 4))
 
-        self.device_list_frame = ctk.CTkScrollableFrame(left, width=355, height=380)
+        sort_bar = ctk.CTkFrame(left, fg_color="transparent")
+        sort_bar.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkLabel(sort_bar, text="Сортировка:").pack(side="left", padx=(2, 6))
+        self.sort_field_var = tk.StringVar(value="IP")
+        ctk.CTkOptionMenu(
+            sort_bar, variable=self.sort_field_var, values=["IP", "Модель"], width=100,
+            command=lambda _v: self._render_device_list(),
+        ).pack(side="left")
+        self.sort_reverse = False
+        self.sort_dir_btn = ctk.CTkButton(
+            sort_bar, text="▲", width=32, command=self._toggle_sort_direction,
+        )
+        self.sort_dir_btn.pack(side="left", padx=(6, 0))
+
+        self.device_list_frame = ctk.CTkScrollableFrame(left, width=405, height=380)
         self.device_list_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         btns = ctk.CTkFrame(left, fg_color="transparent")
@@ -169,7 +187,12 @@ class App(ctk.CTk):
         self._build_record_tab(self.tabview.tab("Запись"))
         self._build_misc_tab(self.tabview.tab("Прочее"))
 
-        ctk.CTkLabel(right, text="Лог:").grid(row=2, column=0, sticky="w", padx=8, pady=(6, 0))
+        log_header = ctk.CTkFrame(right, fg_color="transparent")
+        log_header.grid(row=2, column=0, sticky="ew", padx=8, pady=(6, 0))
+        ctk.CTkLabel(log_header, text="Лог:").pack(side="left")
+        ctk.CTkButton(
+            log_header, text="Очистка", width=80, command=self._clear_log,
+        ).pack(side="right")
         self.log_box = ctk.CTkTextbox(right, height=180)
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=8, pady=(2, 8))
 
@@ -301,6 +324,7 @@ class App(ctk.CTk):
 
         changed = signature(devices) != signature(self.devices)
         self.devices = devices
+        self._fetch_missing_device_info()
         if changed or force_render:
             self._render_device_list()
 
@@ -317,6 +341,54 @@ class App(ctk.CTk):
         self.refresh_devices(force_render=False)
         self._schedule_poll()
 
+    def _toggle_sort_direction(self):
+        self.sort_reverse = not self.sort_reverse
+        self.sort_dir_btn.configure(text=("▼" if self.sort_reverse else "▲"))
+        self._render_device_list()
+
+    def _sorted_devices(self) -> list:
+        """Копия self.devices, отсортированная для отображения. Сам self.devices
+        не трогаем: его порядок используется для сравнения при опросе (см.
+        _apply_refresh), пересортировка там вызывала бы лишние перерисовки."""
+        def ip_key(device: adb_utils.Device):
+            host = device.serial.split(":", 1)[0]
+            try:
+                return (0, tuple(int(part) for part in host.split(".")))
+            except ValueError:
+                return (1, host)  # не похоже на IP (например, USB-serial) — в конец
+
+        def model_key(device: adb_utils.Device):
+            return (device.model or device.serial).lower()
+
+        key_fn = ip_key if self.sort_field_var.get() == "IP" else model_key
+        return sorted(self.devices, key=key_fn, reverse=self.sort_reverse)
+
+    def _fetch_missing_device_info(self):
+        """Производитель/модель/версия Android не приходят с `adb devices -l`,
+        поэтому подтягиваем их отдельным shell-запросом в фоне и кэшируем по
+        serial, чтобы не дёргать adb на каждый 3-секундный опрос."""
+        adb_path = self.adb_path_var.get()
+        for device in self.devices:
+            if device.state != "device":
+                continue  # offline/unauthorized и т.п. не ответят на shell-команду
+            if device.serial in self._device_info_cache:
+                continue
+            self._device_info_cache[device.serial] = "pending"
+            threading.Thread(
+                target=self._fetch_device_info_worker, args=(adb_path, device.serial), daemon=True,
+            ).start()
+
+    def _fetch_device_info_worker(self, adb_path: str, serial: str):
+        info = adb_utils.get_extended_info(adb_path, serial)
+        self.call_in_ui(self._apply_device_info, serial, info)
+
+    def _apply_device_info(self, serial: str, info):
+        if info is None:
+            self._device_info_cache.pop(serial, None)  # попробуем ещё раз на следующем опросе
+            return
+        self._device_info_cache[serial] = info
+        self._render_device_list()
+
     def _render_device_list(self):
         for widget in self.device_list_frame.winfo_children():
             widget.destroy()
@@ -331,9 +403,19 @@ class App(ctk.CTk):
         if self.selected_target.get() not in known_keys:
             self.selected_target.set(self.devices[0].serial)
 
-        for device in self.devices:
+        for device in self._sorted_devices():
             running = self.runner.is_running(device.serial)
-            status_text = f"{device.display_name}\n{device.state}"
+            info = self._device_info_cache.get(device.serial)
+            if isinstance(info, dict):
+                device_line = f"{info['manufacturer']} {info['model']} (Android {info['android']})"
+            elif info == "pending":
+                device_line = "определение модели…"
+            else:
+                device_line = device.model or "—"  # offline/unauthorized: shell недоступен
+            # Явный перенос перед state, а не ". " — иначе wraplength переносит
+            # "device" на новую строку только когда предыдущий текст не влезает
+            # по ширине, и расположение "плавает" от устройства к устройству.
+            status_text = f"{device.serial}\n{device_line}\n{device.state}"
             if running:
                 status_text += " • запущен"
 
@@ -361,15 +443,14 @@ class App(ctk.CTk):
                 command=lambda s=device.serial: self._start_specific(s),
             ).pack(side="right", padx=(3, 0), pady=6)
             ctk.CTkButton(
-#                row, text="⧉", width=28,
-                row, text="COPY IP", width=36,
+                row, text="COPY IP", width=64,
                 command=lambda s=device.serial: self._copy_to_clipboard(s),
             ).pack(side="right", padx=(3, 0), pady=6)
 
             color = "#43a047" if running else ("#fdd835" if device.state != "device" else None)
             label = ctk.CTkLabel(
                 row, text=status_text, text_color=color, anchor="w", justify="left",
-                wraplength=190,
+                wraplength=150,
             )
             label.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=6)
             label.bind("<Double-Button-1>", lambda _e, s=device.serial: self._start_specific(s))
@@ -477,7 +558,10 @@ class App(ctk.CTk):
                 profile=profile,
                 profile_name=profile_name,
                 records_dir=records_dir,
-                on_output=lambda line: self.call_in_ui(self._log, line),
+                # Тег [key] нужен, т.к. при двух параллельных сессиях строки
+                # из разных процессов иначе перемешиваются в общем логе без
+                # возможности понять, к какому устройству какая относится.
+                on_output=lambda line, k=target: self.call_in_ui(self._log, f"[{k}] {line}"),
                 on_exit=lambda key, code: self.call_in_ui(self._on_session_exit, key, code),
             )
             self._log(f">>> Запуск scrcpy для {target} (профиль «{profile_name}»)")
@@ -564,8 +648,12 @@ class App(ctk.CTk):
 
     # --------------------------------------------------------- утилиты
     def _log(self, message: str):
-        self.log_box.insert("end", message + "\n")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_box.insert("end", f"[{timestamp}] {message}\n")
         self.log_box.see("end")
+
+    def _clear_log(self):
+        self.log_box.delete("1.0", "end")
 
     def on_close(self):
         if self.runner.running_keys():

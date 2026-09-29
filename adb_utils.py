@@ -129,6 +129,24 @@ def get_ip_via_usb(adb_path: str, serial: str) -> Optional[str]:
     return None
 
 
+def get_extended_info(adb_path: str, serial: str, timeout: float = 5.0) -> Optional[dict]:
+    """Производитель, модель и версия Android одним вызовом `adb shell`
+    (три getprop за одно соединение быстрее, чем три отдельных вызова adb).
+    None, если устройство не ответило вовремя или свойства не прочитались
+    (например, экран блокировки/недоверенный компьютер на новых Android)."""
+    props = ("ro.product.manufacturer", "ro.product.model", "ro.build.version.release")
+    shell_cmd = " && ".join(f"getprop {p}" for p in props)
+    try:
+        output = _run(adb_path, ["-s", serial, "shell", shell_cmd], timeout=timeout)
+    except AdbError:
+        return None
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
+    manufacturer, model, android = lines[0], lines[1], lines[2]
+    return {"manufacturer": manufacturer, "model": model, "android": android}
+
+
 def adb_version(adb_path: str = "adb") -> Optional[str]:
     try:
         output = _run(adb_path, ["version"], timeout=5.0)
