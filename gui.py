@@ -27,8 +27,7 @@ ORIENTATIONS = ["unlocked", "initial", "0", "1", "2", "3"]
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # при правках изменять номер версии
-        self.title("Scroid v1.10 feat. Claude")
+        self.title("Scroid v1.11 feat. Claude")
         self.geometry("1080x720")
         self.minsize(920, 620)
 
@@ -38,7 +37,6 @@ class App(ctk.CTk):
         self.devices: list[adb_utils.Device] = []
         # serial -> {"manufacturer":..., "model":..., "android":...} | "pending"
         self._device_info_cache: dict = {}
-        self.selected_target = tk.StringVar(value="")
         self.current_profile_name = tk.StringVar(
             value=self.config_data.get("last_used_profile", "По умолчанию")
         )
@@ -102,7 +100,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(sort_bar, text="Сортировка:").pack(side="left", padx=(2, 6))
         self.sort_field_var = tk.StringVar(value="IP")
         ctk.CTkOptionMenu(
-            sort_bar, variable=self.sort_field_var, values=["IP", "Модель"], width=100,
+            sort_bar, variable=self.sort_field_var,
+            values=["IP", "Модель", "Версия Android", "Состояние"], width=140,
             command=lambda _v: self._render_device_list(),
         ).pack(side="left")
         self.sort_reverse = False
@@ -360,7 +359,36 @@ class App(ctk.CTk):
         def model_key(device: adb_utils.Device):
             return (device.model or device.serial).lower()
 
-        key_fn = ip_key if self.sort_field_var.get() == "IP" else model_key
+        def state_key(device: adb_utils.Device):
+            return device.state.lower()
+
+        def android_version(device: adb_utils.Device):
+            """Кортеж чисел из ro.build.version.release ("8.1.0" -> (8,1,0)),
+            чтобы 9 не оказалась "больше" 13 при обычном текстовом сравнении."""
+            info = self._device_info_cache.get(device.serial)
+            if not isinstance(info, dict):
+                return None
+            raw = (info.get("android") or "").strip()
+            parts = []
+            for chunk in raw.split("."):
+                try:
+                    parts.append(int(chunk))
+                except ValueError:
+                    break
+            return tuple(parts) if parts else None
+
+        field = self.sort_field_var.get()
+        if field == "Версия Android":
+            # Версия приходит асинхронно (adb shell) и есть не всегда (offline,
+            # unauthorized, ещё не опрошено) — такие устройства всегда в конце
+            # списка независимо от направления сортировки, а не прыгают в
+            # начало при "убывании" из-за инверсии сравнения None-подобных ключей.
+            known = [d for d in self.devices if android_version(d) is not None]
+            unknown = [d for d in self.devices if android_version(d) is None]
+            known.sort(key=android_version, reverse=self.sort_reverse)
+            return known + unknown
+
+        key_fn = {"IP": ip_key, "Модель": model_key, "Состояние": state_key}[field]
         return sorted(self.devices, key=key_fn, reverse=self.sort_reverse)
 
     def _fetch_missing_device_info(self):
@@ -399,10 +427,6 @@ class App(ctk.CTk):
             )
             return
 
-        known_keys = {d.serial for d in self.devices}
-        if self.selected_target.get() not in known_keys:
-            self.selected_target.set(self.devices[0].serial)
-
         for device in self._sorted_devices():
             running = self.runner.is_running(device.serial)
             info = self._device_info_cache.get(device.serial)
@@ -415,7 +439,7 @@ class App(ctk.CTk):
             # Явный перенос перед state, а не ". " — иначе wraplength переносит
             # "device" на новую строку только когда предыдущий текст не влезает
             # по ширине, и расположение "плавает" от устройства к устройству.
-            status_text = f"{device.serial}\n{device_line}\n{device.state}"
+            status_text = f"{device.serial}\n{device_line}.\n{device.state}"
             if running:
                 status_text += " • запущен"
 
@@ -427,11 +451,6 @@ class App(ctk.CTk):
             # («… • запущен») забирает всю ширину и кнопки выдавливает за
             # край строки. Поэтому сначала упаковываем радиокнопку и кнопки
             # справа, а надпись — последней: ей достаётся остаток места.
-            radio = ctk.CTkRadioButton(
-                row, text="", variable=self.selected_target, value=device.serial, width=18,
-            )
-            radio.pack(side="left", padx=(6, 0), pady=6)
-
             ctk.CTkButton(
                 row, text="■", width=28, fg_color="#b71c1c", hover_color="#7f0000",
                 state=("normal" if running else "disabled"),
@@ -453,7 +472,7 @@ class App(ctk.CTk):
                 wraplength=150,
             )
             label.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=6)
-            label.bind("<Double-Button-1>", lambda _e, s=device.serial: self._start_specific(s))
+            label.bind("<Double-Button-1>", lambda _e, s=device.serial: self._toggle_specific(s))
 
     # --------------------------------------------------------- профили
     def _collect_profile_from_form(self) -> dict:
@@ -521,29 +540,23 @@ class App(ctk.CTk):
         self._refresh_profile_combo(next(iter(self.config_data["profiles"])))
 
     # --------------------------------------------------------- запуск
-    def _start_selected(self, force_target: "str | None" = None):
+    def _start_selected(self, target: str):
+        """Запуск конкретного устройства (target = serial / ip:port) с профилем,
+        который сейчас выбран в редакторе. Вызывается только по кнопке ▶ строки
+        или двойным кликом по ней — отдельной общей кнопки запуска больше нет,
+        у каждого устройства собственные ▶/■."""
         profile = self._collect_profile_from_form()
         explicit_target = (profile.get("target") or "").strip()
-
-        if force_target:
-            # Двойной клик по конкретному устройству — это явное намерение
-            # пользователя, оно важнее сохранённого в профиле поля target.
-            target = force_target
-            if explicit_target and explicit_target != force_target:
-                self._log(
-                    f"Профиль «{self.current_profile_name.get()}» содержит явную "
-                    f"цель «{explicit_target}» (вкладка «Прочее») — для этого запуска "
-                    f"она проигнорирована, запускаю именно {force_target}."
-                )
-        else:
-            target = explicit_target or self.selected_target.get()
-            if explicit_target and self.selected_target.get() and explicit_target != self.selected_target.get():
-                self._log(
-                    f"Внимание: в профиле «{self.current_profile_name.get()}» задана "
-                    f"явная цель «{explicit_target}» (вкладка «Прочее») — она приоритетнее "
-                    f"выбора в списке слева. Очистите поле, если хотите запускать то, "
-                    f"что выбрано radio-кнопкой."
-                )
+        if explicit_target and explicit_target != target:
+            # Явная цель в профиле (вкладка «Прочее») исторически имела приоритет,
+            # но раз запуск теперь всегда привязан к конкретной строке списка —
+            # это скорее опечатка в профиле, чем осознанный выбор, поэтому только
+            # предупреждаем и всё равно запускаем то устройство, по которому кликнули.
+            self._log(
+                f"Профиль «{self.current_profile_name.get()}» содержит явную "
+                f"цель «{explicit_target}» (вкладка «Прочее») — для этого запуска "
+                f"она проигнорирована, запускаю именно {target}."
+            )
 
         if not target:
             messagebox.showwarning("Внимание", "Сначала выберите устройство")
@@ -570,13 +583,21 @@ class App(ctk.CTk):
         self._render_device_list()
 
     def _start_specific(self, serial: str):
-        self.selected_target.set(serial)
         if self.runner.is_running(serial):
             # Двойной клик по уже запущенному устройству — не ошибка, а просто
             # напоминание; модальное окно тут только мешает.
             self._log(f"scrcpy для {serial} уже запущен (для остановки нажмите ■)")
             return
-        self._start_selected(force_target=serial)
+        self._start_selected(target=serial)
+
+    def _toggle_specific(self, serial: str):
+        """Двойной клик по названию устройства: если сессия уже идёт — стоп,
+        иначе старт с текущим профилем. Так двойной клик работает как единая
+        кнопка «пуск/стоп» для всей строки, а не только для запуска."""
+        if self.runner.is_running(serial):
+            self._stop_specific(serial)
+        else:
+            self._start_selected(target=serial)
 
     def _stop_specific(self, serial: str):
         # terminate()+wait() могут ждать до 5 с — делаем это вне главного потока.
@@ -695,6 +716,18 @@ class WifiDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             scroll, text="Уже подключён по USB → включить TCP/IP", font=("", 12, "bold")
         ).pack(anchor="w", padx=8, pady=(8, 2))
+        # Раньше цель для этой кнопки бралась из radio-кнопки в общем списке
+        # устройств слева; список избавили от неё (у каждой строки свои ▶/■),
+        # поэтому здесь свой собственный выбор именно USB-устройства.
+        usb_serials = [d.serial for d in self.app.devices if ":" not in d.serial]
+        self.usb_target_var = tk.StringVar(value=(usb_serials[0] if usb_serials else ""))
+        self.usb_device_menu = ctk.CTkOptionMenu(
+            scroll, variable=self.usb_target_var,
+            values=(usb_serials or ["USB-устройства не найдены"]),
+        )
+        self.usb_device_menu.pack(fill="x", padx=8, pady=2)
+        if not usb_serials:
+            self.usb_device_menu.configure(state="disabled")
         ctk.CTkButton(
             scroll, text="Включить TCP/IP на 5555 для выбранного устройства",
             command=self._enable_tcpip,
@@ -771,9 +804,14 @@ class WifiDialog(ctk.CTkToplevel):
 
     # ------------------------------------------------------------ USB → TCP/IP
     def _enable_tcpip(self):
-        target = self.app.selected_target.get()
-        if not target:
-            messagebox.showwarning("Внимание", "Сначала выберите USB-устройство слева")
+        target = self.usb_target_var.get()
+        usb_serials = {d.serial for d in self.app.devices if ":" not in d.serial}
+        if not target or target not in usb_serials:
+            messagebox.showwarning(
+                "Внимание",
+                "Нет доступного USB-устройства. Подключите телефон по USB, "
+                "разрешите отладку на экране и откройте это окно заново.",
+            )
             return
         if ":" in target:
             messagebox.showwarning(
